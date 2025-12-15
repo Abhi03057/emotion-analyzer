@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+venv/
+
+# Data
+data/face/
+data/text/
+
+# Model weights
+*.pth
+*.bin
+*.safetensors
+text_model/models/
+
+# OS files
+.DS_Store
+Thumbs.db
