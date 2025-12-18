@@ -13,10 +13,10 @@ data/text/
 *.pth
 *.bin
 *.safetensors
+
+# HuggingFace / Transformers models
 text_model/models/
 
 # OS files
 .DS_Store
 Thumbs.db
-# Results / screenshots
-results/
