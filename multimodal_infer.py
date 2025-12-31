@@ -49,32 +49,47 @@
 import sys
 import torch
 import numpy as np
-
-# ---------------- CONFIG ----------------
-EMOTIONS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
-
-TEXT_MODEL_PATH = "text_model/models/distilbert_go7"
-FACE_MODEL_PATH = "face_model/models/face_resnet18_fer2013.pth"
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# ---------------------------------------
-
-
-# -------- TEXT MODEL --------
+from PIL import Image
+from torchvision import models, transforms
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-text_tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_PATH)
-text_model = AutoModelForSequenceClassification.from_pretrained(TEXT_MODEL_PATH)
-text_model.to(DEVICE)
+# ================= CONFIG =================
+EMOTIONS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+
+# ---- SWITCH MODELS HERE ----
+TEXT_BACKBONE = "roberta"       # "distilbert" | "roberta"
+FACE_BACKBONE = "efficientnet" # "resnet18" | "efficientnet"
+
+TEXT_MODEL_PATHS = {
+    "distilbert": "text_model/models/distilbert_go7",
+    "roberta": "text_model/models/roberta_go7"
+}
+
+FACE_MODEL_PATHS = {
+    "resnet18": "face_model/models/face_resnet18_fer2013.pth",
+    "efficientnet": "face_model/models/face_efficientnet_b0.pth"
+}
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ==========================================
+
+
+# ================= TEXT MODEL =================
+print(f"Loading text model from: {TEXT_MODEL_PATHS[TEXT_BACKBONE]}")
+tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_PATHS[TEXT_BACKBONE])
+text_model = AutoModelForSequenceClassification.from_pretrained(
+    TEXT_MODEL_PATHS[TEXT_BACKBONE]
+).to(DEVICE)
 text_model.eval()
 
 
 def infer_text(text):
-    inputs = text_tokenizer(
+    inputs = tokenizer(
         text,
         return_tensors="pt",
         truncation=True,
-        padding=True
+        padding=True,
+        max_length=128
     ).to(DEVICE)
 
     with torch.no_grad():
@@ -84,15 +99,22 @@ def infer_text(text):
     return dict(zip(EMOTIONS, probs))
 
 
-# -------- FACE MODEL --------
-from torchvision import models, transforms
-from PIL import Image
+# ================= FACE MODEL =================
+print(f"Loading face model from: {FACE_MODEL_PATHS[FACE_BACKBONE]}")
 
-face_model = models.resnet18(weights=None)
-face_model.fc = torch.nn.Linear(face_model.fc.in_features, len(EMOTIONS))
-checkpoint = torch.load(FACE_MODEL_PATH, map_location=DEVICE)
+if FACE_BACKBONE == "resnet18":
+    face_model = models.resnet18(weights=None)
+    face_model.fc = torch.nn.Linear(face_model.fc.in_features, len(EMOTIONS))
+
+elif FACE_BACKBONE == "efficientnet":
+    face_model = models.efficientnet_b0(weights=None)
+    face_model.classifier[1] = torch.nn.Linear(
+        face_model.classifier[1].in_features,
+        len(EMOTIONS)
+    )
+
+checkpoint = torch.load(FACE_MODEL_PATHS[FACE_BACKBONE], map_location=DEVICE)
 face_model.load_state_dict(checkpoint["model_state_dict"])
-
 face_model.to(DEVICE)
 face_model.eval()
 
@@ -117,36 +139,56 @@ def infer_face(image_path):
     return dict(zip(EMOTIONS, probs))
 
 
-# -------- CONFIDENCE-AWARE FUSION --------
-def fuse_emotions(text_probs, face_probs):
+# ================= CONFIDENCE + CONSISTENCY =================
+def confidence_weighted_fusion(text_probs, face_probs):
     text_conf = max(text_probs.values())
     face_conf = max(face_probs.values())
 
-    total = text_conf + face_conf + 1e-8
-    w_text = text_conf / total
-    w_face = face_conf / total
+    total_conf = text_conf + face_conf + 1e-8
+    w_text = text_conf / total_conf
+    w_face = face_conf / total_conf
 
-    fused = {}
-    for emo in EMOTIONS:
-        fused[emo] = (
-            w_text * text_probs.get(emo, 0.0) +
-            w_face * face_probs.get(emo, 0.0)
-        )
+    fused = {
+        emo: w_text * text_probs[emo] + w_face * face_probs[emo]
+        for emo in EMOTIONS
+    }
 
-    # normalize
+    # Normalize
     s = sum(fused.values())
-    for emo in fused:
-        fused[emo] /= s
+    fused = {k: v / s for k, v in fused.items()}
 
     final_emotion = max(fused, key=fused.get)
-    return final_emotion, fused, w_text, w_face
+
+    # ---------- CONSISTENCY ----------
+    top_text = max(text_probs, key=text_probs.get)
+    top_face = max(face_probs, key=face_probs.get)
+
+    consistency_score = 1 - abs(text_conf - face_conf)
+
+    if top_text == top_face:
+        consistency_label = "High"
+        interpretation = (
+            f"Both text and facial expressions consistently indicate {final_emotion}."
+        )
+    elif consistency_score > 0.5:
+        consistency_label = "Medium"
+        interpretation = (
+            f"Text suggests {top_text}, while facial cues lean towards {top_face}."
+        )
+    else:
+        consistency_label = "Low"
+        interpretation = (
+            f"User expresses {top_text} verbally but facial cues indicate {top_face}."
+        )
+
+    return final_emotion, fused, w_text, w_face, consistency_score, consistency_label, interpretation
 
 
-# -------- MAIN --------
+# ================= MAIN =================
 if __name__ == "__main__":
     if len(sys.argv) != 3:
         print("Usage:")
-        print("python multimodal_infer.py \"text\" \"path_to_image\"")
+        print("python multimodal_infer.py \"text\" \"image_path\"")
         sys.exit(1)
 
     text = sys.argv[1]
@@ -155,15 +197,28 @@ if __name__ == "__main__":
     text_probs = infer_text(text)
     face_probs = infer_face(image_path)
 
-    emotion, fused_probs, wt, wf = fuse_emotions(text_probs, face_probs)
+    (
+        emotion,
+        fused_probs,
+        wt,
+        wf,
+        consistency_score,
+        consistency_label,
+        interpretation
+    ) = confidence_weighted_fusion(text_probs, face_probs)
 
     print("\n🧠 Multimodal Emotion Detection")
     print("Text :", text)
     print("Image:", image_path)
 
     print(f"\nFusion Weights → Text: {wt:.2f}, Face: {wf:.2f}")
-    print("\nFinal Emotion:", emotion)
+    print(f"Final Emotion: {emotion}")
+
+    print(f"\nConsistency Score: {consistency_score:.2f}")
+    print(f"Consistency Level: {consistency_label}")
+    print(f"Interpretation: {interpretation}")
 
     print("\nProbabilities:")
     for k, v in sorted(fused_probs.items(), key=lambda x: -x[1]):
         print(f"{k:10s}: {v:.4f}")
+
