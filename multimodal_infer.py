@@ -45,7 +45,6 @@
 
 
 # improved code for confidence based fusion 
-
 import sys
 import torch
 import numpy as np
@@ -57,8 +56,8 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 EMOTIONS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 
 # ---- SWITCH MODELS HERE ----
-TEXT_BACKBONE = "roberta"       # "distilbert" | "roberta"
-FACE_BACKBONE = "efficientnet" # "resnet18" | "efficientnet"
+TEXT_BACKBONE = "roberta"        # "distilbert" | "roberta"
+FACE_BACKBONE = "efficientnet"  # "resnet18" | "efficientnet"
 
 TEXT_MODEL_PATHS = {
     "distilbert": "text_model/models/distilbert_go7",
@@ -76,12 +75,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ================= TEXT MODEL =================
 print(f"Loading text model from: {TEXT_MODEL_PATHS[TEXT_BACKBONE]}")
+
 tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_PATHS[TEXT_BACKBONE])
 text_model = AutoModelForSequenceClassification.from_pretrained(
     TEXT_MODEL_PATHS[TEXT_BACKBONE]
 ).to(DEVICE)
 text_model.eval()
-
 
 def infer_text(text):
     inputs = tokenizer(
@@ -127,7 +126,6 @@ face_transform = transforms.Compose([
     )
 ])
 
-
 def infer_face(image_path):
     image = Image.open(image_path).convert("RGB")
     image = face_transform(image).unsqueeze(0).to(DEVICE)
@@ -140,16 +138,17 @@ def infer_face(image_path):
 
 
 # ================= CONFIDENCE + CONSISTENCY =================
-def confidence_weighted_fusion(text_probs, face_probs):
+def fuse_emotions(text_probs, face_probs):
     text_conf = max(text_probs.values())
     face_conf = max(face_probs.values())
 
-    total_conf = text_conf + face_conf + 1e-8
-    w_text = text_conf / total_conf
-    w_face = face_conf / total_conf
+    total = text_conf + face_conf + 1e-8
+    w_text = text_conf / total
+    w_face = face_conf / total
 
     fused = {
-        emo: w_text * text_probs[emo] + w_face * face_probs[emo]
+        emo: w_text * text_probs.get(emo, 0.0) +
+             w_face * face_probs.get(emo, 0.0)
         for emo in EMOTIONS
     }
 
@@ -157,31 +156,40 @@ def confidence_weighted_fusion(text_probs, face_probs):
     s = sum(fused.values())
     fused = {k: v / s for k, v in fused.items()}
 
+    # Consistency estimation
+    text_top = max(text_probs, key=text_probs.get)
+    face_top = max(face_probs, key=face_probs.get)
+
+    if text_top == face_top:
+        consistency = min(text_conf, face_conf)
+    else:
+        consistency = abs(text_conf - face_conf)
+
     final_emotion = max(fused, key=fused.get)
+    return final_emotion, fused, w_text, w_face, consistency
 
-    # ---------- CONSISTENCY ----------
-    top_text = max(text_probs, key=text_probs.get)
-    top_face = max(face_probs, key=face_probs.get)
 
-    consistency_score = 1 - abs(text_conf - face_conf)
-
-    if top_text == top_face:
-        consistency_label = "High"
+def interpret_emotion(final_emotion, consistency):
+    if consistency >= 0.85:
+        level = "High"
         interpretation = (
-            f"Both text and facial expressions consistently indicate {final_emotion}."
+            f"The detected emotion is {final_emotion}, with strong agreement "
+            "between modalities, indicating a genuine emotional state."
         )
-    elif consistency_score > 0.5:
-        consistency_label = "Medium"
+    elif consistency >= 0.60:
+        level = "Medium"
         interpretation = (
-            f"Text suggests {top_text}, while facial cues lean towards {top_face}."
+            f"The user appears {final_emotion}, but partial inconsistency "
+            "suggests emotional masking or mixed feelings."
         )
     else:
-        consistency_label = "Low"
+        level = "Low"
         interpretation = (
-            f"User expresses {top_text} verbally but facial cues indicate {top_face}."
+            f"The detected emotion is {final_emotion}, but strong inconsistency "
+            "indicates emotional suppression, sarcasm, or low confidence."
         )
 
-    return final_emotion, fused, w_text, w_face, consistency_score, consistency_label, interpretation
+    return level, interpretation
 
 
 # ================= MAIN =================
@@ -197,26 +205,24 @@ if __name__ == "__main__":
     text_probs = infer_text(text)
     face_probs = infer_face(image_path)
 
-    (
-        emotion,
-        fused_probs,
-        wt,
-        wf,
-        consistency_score,
-        consistency_label,
-        interpretation
-    ) = confidence_weighted_fusion(text_probs, face_probs)
+    final_emotion, fused_probs, wt, wf, consistency = fuse_emotions(
+        text_probs, face_probs
+    )
+
+    level, interpretation = interpret_emotion(final_emotion, consistency)
 
     print("\n🧠 Multimodal Emotion Detection")
     print("Text :", text)
     print("Image:", image_path)
 
     print(f"\nFusion Weights → Text: {wt:.2f}, Face: {wf:.2f}")
-    print(f"Final Emotion: {emotion}")
+    print("Final Emotion:", final_emotion.capitalize())
 
-    print(f"\nConsistency Score: {consistency_score:.2f}")
-    print(f"Consistency Level: {consistency_label}")
-    print(f"Interpretation: {interpretation}")
+    print(f"\nConsistency Score: {consistency:.2f}")
+    print("Consistency Level:", level)
+
+    print("\nInterpretation:")
+    print(interpretation)
 
     print("\nProbabilities:")
     for k, v in sorted(fused_probs.items(), key=lambda x: -x[1]):
